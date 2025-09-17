@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pymupdf
+sentence-transformers
+rank-bm25
+numpy
+pydantic
+pillow
+pytesseract
+python-multipart
+faiss-cpu

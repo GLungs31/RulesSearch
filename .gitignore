@@ -1,0 +1,10 @@
+# Python / IDE
+__pycache__/
+*.pyc
+.idea/
+.venv/
+
+# App data
+handbooks/
+store/
+*.pdf
