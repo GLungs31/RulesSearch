@@ -623,7 +623,6 @@ q.addEventListener('keydown', (e) => { if (e.key === 'Enter') ask(); });
 </body>
 </html>
 """
-
 if __name__ == "__main__":
     # Start the API directly so you can click Run in PyCharm
     import uvicorn
