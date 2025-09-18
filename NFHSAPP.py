@@ -17,6 +17,8 @@ import numpy as np
 import fitz  # PyMuPDF
 
 from threading import Thread, Lock
+from fastapi import HTTPException
+import uuid, time
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,8 +50,6 @@ from rank_bm25 import BM25Okapi
 # --------------------- Config ---------------------
 DATA_DIR = os.getenv("HB_DATA_DIR", "./handbooks")
 STORE_DIR = os.getenv("HB_STORE_DIR", "./store")
-DATA_DIR = "./handbooks"     # put PDFs here
-STORE_DIR = "./store"        # index/metadata here
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -59,16 +59,88 @@ FAISS_PATH = os.path.join(STORE_DIR, "handbooks.faiss")
 EMB_PATH   = os.path.join(STORE_DIR, "embeddings.npy")
 META_PATH  = os.path.join(STORE_DIR, "metadata.json")
 
+# --------------------- FastAPI app ---------------------
 app = FastAPI(title="HS Athletics Handbook Bot", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# Health check (quick “is it up?”)
+# (optional) serve PDFs so source links can open to exact page
+app.mount("/handbooks", StaticFiles(directory=DATA_DIR), name="handbooks")
+
+# --------------------- Background ingest plumbing ---------------------
+INGEST_JOBS = {}
+INGEST_LOCK = Lock()
+
+def _ingest_worker(job_id: str):
+    """Runs in background: reads PDFs and builds the index."""
+    try:
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id] = {**INGEST_JOBS.get(job_id, {}), "status": "running"}
+
+        corpus = build_corpus(DATA_DIR)        # you already have this
+        INDEX.build(corpus, persist=True)      # uses your HybridIndex
+
+        files = len({c["metadata"]["file"] for c in corpus}) if corpus else 0
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id].update(
+                status="done",
+                chunks=len(corpus),
+                files=files,
+                finished_at=time.time(),
+                message="Index built."
+            )
+    except Exception as e:
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id].update(
+                status="error",
+                error=str(e),
+                finished_at=time.time()
+            )
+
+# --------------------- Endpoints ---------------------
+
+# Health check
 @app.get("/health")
 def health():
     return {"ok": True, "docs": "/docs"}
+
+# Save-only upload (fast) — do NOT index here
+@app.post("/upload")
+def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        return {"ok": False, "error": "Only PDF files are accepted."}
+    os.makedirs(DATA_DIR, exist_ok=True)
+    dest = os.path.join(DATA_DIR, file.filename)
+    with open(dest, "wb") as out:
+        out.write(file.file.read())
+    return {"ok": True, "stored_as": dest, "message": "Uploaded. Now run POST /ingest-start."}
+
+# Start ingest in background (returns job_id quickly)
+@app.post("/ingest-start")
+def ingest_start():
+    job_id = str(uuid.uuid4())
+    with INGEST_LOCK:
+        INGEST_JOBS[job_id] = {"status": "queued", "started_at": time.time()}
+    Thread(target=_ingest_worker, args=(job_id,), daemon=True).start()
+    return {"job_id": job_id, "status": "queued", "tip": "Poll /ingest-status/{job_id} until status=done."}
+
+# Poll ingest status
+@app.get("/ingest-status/{job_id}")
+def ingest_status(job_id: str):
+    job = INGEST_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
+
+
+@app.get("/ingest-status/{job_id}")
+def ingest_status(job_id: str):
+    job = INGEST_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
 
 # Save-only upload (fast) — use this to upload PDFs
 @app.post("/upload")
@@ -84,13 +156,6 @@ def upload_pdf(file: UploadFile = File(...)):
 
 # Start ingest in background (returns a job_id immediately)
 @app.post("/ingest-start")
-def ingest_start():
-    job_id = str(uuid.uuid4())
-    with INGEST_LOCK:
-        INGEST_JOBS[job_id] = {"status": "queued", "started_at": time.time()}
-    t = Thread(target=_ingest_worker, args=(job_id,), daemon=True)
-    t.start()
-    return {"job_id": job_id, "status": "queued", "tip": "Poll /ingest-status/{job_id} until status=done."}
 
 # Poll ingest job status
 @app.get("/ingest-status/{job_id}")
@@ -163,6 +228,206 @@ def _ingest_worker(job_id: str):
             )
 
 # --------------------- Helpers --------------------
+# ========= SAFE, DROP-IN HYBRID INDEX (with empty-text guard) =========
+# Requires: from sentence_transformers import SentenceTransformer
+#           from rank_bm25 import BM25Okapi
+#           try: import faiss; FAISS_OK=True except: FAISS_OK=False
+# Also needs STORE_DIR to exist (we set default if missing)
+
+# defaults if not set earlier
+STORE_DIR = os.getenv("HB_STORE_DIR", "./store")
+os.makedirs(STORE_DIR, exist_ok=True)
+FAISS_PATH = os.path.join(STORE_DIR, "handbooks.faiss")
+EMB_PATH   = os.path.join(STORE_DIR, "embeddings.npy")
+META_PATH  = os.path.join(STORE_DIR, "metadata.json")
+EMBED_MODEL_NAME = os.getenv("HB_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+class HybridIndex:
+    def __init__(self, embed_model_name: str = EMBED_MODEL_NAME):
+        self.embed_model_name = embed_model_name
+        self.model = None                # SentenceTransformer
+        self.faiss_index = None          # FAISS index (optional)
+        self.embeddings = None           # numpy array fallback
+        self.corpus = []                 # list of {text, metadata}
+        self.texts = []                  # list of strings
+        self.tokens = []                 # list[list[str]] for BM25
+        self.bm25 = None                 # BM25Okapi
+
+    # --------------- BUILD ----------------
+    def build(self, corpus: List[Dict[str, Any]], persist: bool = True) -> None:
+        # Keep metadata and only non-empty texts
+        self.corpus = corpus or []
+        self.texts = [c.get("text", "") for c in self.corpus if (c.get("text", "").strip())]
+
+        # Build BM25 even if small
+        self.tokens = [self._tokenize_for_bm25(t) for t in self.texts]
+        self.bm25 = BM25Okapi(self.tokens) if self.texts else None
+
+        # ⛑️ Empty-text guard: do NOT try to embed if nothing to index
+        if not self.texts:
+            self.faiss_index = None
+            self.embeddings = None
+            self.model = None
+            if persist:
+                with open(META_PATH, "w", encoding="utf-8") as f:
+                    json.dump(self.corpus, f, ensure_ascii=False)
+            print("No text to index (0 chunks). Upload PDFs and run /ingest-start later.")
+            return
+
+        # Build embeddings (only if we have text)
+        self.model = SentenceTransformer(self.embed_model_name)
+        embs = self.model.encode(self.texts, normalize_embeddings=True, show_progress_bar=False).astype("float32")
+
+        # Prefer FAISS; else keep numpy
+        if 'FAISS_OK' in globals() and FAISS_OK:
+            dim = embs.shape[1]
+            import faiss  # safe: only if available
+            index = faiss.IndexFlatIP(dim)
+            index.add(embs)
+            self.faiss_index = index
+            if persist:
+                faiss.write_index(self.faiss_index, FAISS_PATH)
+                np.save(EMB_PATH, embs)
+        else:
+            self.embeddings = embs
+            if persist:
+                np.save(EMB_PATH, embs)
+
+        if persist:
+            with open(META_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.corpus, f, ensure_ascii=False)
+
+    # --------------- LOAD -----------------
+    def load(self) -> bool:
+        # load metadata first
+        if not os.path.exists(META_PATH):
+            return False
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                self.corpus = json.load(f)
+            self.texts = [c.get("text", "") for c in self.corpus if (c.get("text", "").strip())]
+
+            # BM25 (ok if empty)
+            self.tokens = [self._tokenize_for_bm25(t) for t in self.texts]
+            self.bm25 = BM25Okapi(self.tokens) if self.texts else None
+
+            # Embedding model only needed for queries if we’ll use vectors
+            self.model = SentenceTransformer(self.embed_model_name) if self.texts else None
+
+            # Try FAISS first
+            if 'FAISS_OK' in globals() and FAISS_OK and os.path.exists(FAISS_PATH):
+                import faiss
+                self.faiss_index = faiss.read_index(FAISS_PATH)
+                self.embeddings = None
+                return True
+
+            # Else numpy embeddings
+            if os.path.exists(EMB_PATH):
+                self.embeddings = np.load(EMB_PATH)
+                self.faiss_index = None
+                return True
+
+            # Nothing persisted beyond metadata
+            return bool(self.texts)
+        except Exception:
+            return False
+
+    # --------------- SEARCH ---------------
+    def hybrid_search(
+        self,
+        query: str,
+        k: int = 8,
+        filters: Optional[Dict[str, str]] = None,
+        bm25_weight: float = 0.45,
+        vect_weight: float = 0.55
+    ) -> List[Dict[str, Any]]:
+        # If index not ready, return empty
+        if not self.texts or (self.bm25 is None and self.faiss_index is None and self.embeddings is None):
+            return []
+
+        filters = filters or {}
+        candidates = self._filter_candidates(filters)
+
+        # Vector scores
+        vec_pairs = []
+        if self.model is not None and (self.faiss_index is not None or self.embeddings is not None):
+            q_emb = self.model.encode([query], normalize_embeddings=True).astype("float32")[0]
+            if self.faiss_index is not None:
+                topN = min(k * 4, len(self.texts))
+                scores, idxs = self.faiss_index.search(q_emb.reshape(1, -1), topN)
+                vec_pairs = list(zip(idxs[0].tolist(), scores[0].tolist()))
+            elif self.embeddings is not None:
+                sims = self.embeddings @ q_emb
+                idxs = np.argsort(-sims)[:min(k * 4, len(self.texts))]
+                vec_pairs = [(int(i), float(sims[int(i)])) for i in idxs]
+
+            if candidates is not None:
+                vec_pairs = [(i, s) for i, s in vec_pairs if i in candidates]
+
+        # Normalize vector scores to [0..1]
+        vec_norm = [((s + 1.0) / 2.0) for _, s in vec_pairs] if vec_pairs else []
+
+        # BM25 scores
+        q_tokens = self._tokenize_for_bm25(query)
+        if self.bm25 is None:
+            bm_pairs = []
+            bm_norm = {}
+        else:
+            bm_scores = self.bm25.get_scores(q_tokens)
+            bm_pairs = list(enumerate(bm_scores))
+            if candidates is not None:
+                bm_pairs = [(i, sc) for i, sc in bm_pairs if i in candidates]
+            if bm_pairs:
+                vals = [sc for _, sc in bm_pairs]
+                mn, mx = min(vals), max(vals)
+                rng = (mx - mn) or 1.0
+                bm_norm = {i: (sc - mn) / rng for i, sc in bm_pairs}
+            else:
+                bm_norm = {}
+
+        # Combine
+        combined: Dict[int, float] = {}
+        for (i, s), ns in zip(vec_pairs, vec_norm):
+            combined[i] = combined.get(i, 0.0) + vect_weight * ns
+        for i, _ in bm_pairs:
+            combined[i] = combined.get(i, 0.0) + bm25_weight * bm_norm.get(i, 0.0)
+
+        ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:k]
+        results = []
+        for idx, score in ranked:
+            hit = self.corpus[idx]
+            results.append({"score": float(score), "text": hit["text"], "metadata": hit["metadata"]})
+        return results
+
+    # --------------- HELPERS --------------
+    def _tokenize_for_bm25(self, text: str) -> List[str]:
+        text = text.lower()
+        text = text.translate(str.maketrans("", "", string.punctuation))
+        return text.split()
+
+    def _filter_candidates(self, filters: Dict[str, str]) -> Optional[set]:
+        if not filters:
+            return None
+        cands = set()
+        for i, c in enumerate(self.corpus):
+            m = c.get("metadata", {})
+            ok = True
+            for k, v in filters.items():
+                if not v:
+                    continue
+                have = (m.get(k, "") or "")
+                if str(v).lower() not in str(have).lower():
+                    ok = False
+                    break
+            if ok:
+                cands.add(i)
+        # if nothing matched, fall back to unfiltered
+        return cands if cands else None
+
+# Make a global index instance you can use everywhere
+INDEX = HybridIndex()
+# ========= END HYBRID INDEX =========
+
 HEAD_RE = re.compile(r"^(Article|Rule|Section|Bylaw|Policy)\s+[\w\.\-]+.*", re.I | re.M)
 
 def normalize_space(s: str) -> str:
@@ -514,9 +779,35 @@ class IngestResponse(BaseModel):
 
 # --------------------- FastAPI app ----------------------
 app = FastAPI(title="Athletics Handbooks Chatbot", version="1.0.0")
-@app.on_event("startup")
-def _startup():
-    ensure_index_loaded()  # safe: it should skip if no PDFs exist
+def _ingest_worker(job_id: str):
+    try:
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id] = {**INGEST_JOBS.get(job_id, {}), "status": "running"}
+
+        # build the index (these two functions already exist in your file)
+        corpus = build_corpus(DATA_DIR)
+        INDEX.build(corpus, persist=True)
+
+        files = len({c["metadata"]["file"] for c in corpus}) if corpus else 0
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id].update(
+                status="done",
+                chunks=len(corpus),
+                files=files,
+                finished_at=time.time(),
+                message="Index built."
+            )
+    except Exception as e:
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id].update(
+                status="error",
+                error=str(e),
+                finished_at=time.time()
+            )
+
+INGEST_JOBS = {}
+INGEST_LOCK = Lock()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -527,24 +818,20 @@ app.add_middleware(
 INDEX = HybridIndex()
 
 def ensure_index_loaded() -> None:
-    # Try loading an existing index (OK if none yet)
-    loaded = INDEX.load()
-    if loaded:
+    if INDEX.load():
         print("Index loaded.")
         return
-
-    # If there are no PDFs yet, skip building (keep API alive)
     os.makedirs(DATA_DIR, exist_ok=True)
     pdfs = [f for f in os.listdir(DATA_DIR) if f.lower().endswith(".pdf")]
     if not pdfs:
-        print(f"No PDFs found in {DATA_DIR}. Upload via /upload then run /ingest.")
+        print(f"No PDFs found in {DATA_DIR}. Upload via /upload then run /ingest-start.")
         return
-
-    # Build only if PDFs are present
     corpus = build_corpus(DATA_DIR)
     INDEX.build(corpus, persist=True)
-    print(f"Built index with {len(corpus)} chunks from {len({c['metadata']['file'] for c in corpus})} files.")
-
+    print(f"Built index with {len(corpus)} chunks.")
+@app.on_event("startup")
+def _startup():
+    ensure_index_loaded()   # must SKIP building if no PDFs exist
 
 @app.get("/health")
 def health():
@@ -585,8 +872,8 @@ def upload_pdf(file: UploadFile = File(...)):
     dest = os.path.join(DATA_DIR, file.filename)
     with open(dest, "wb") as out:
         out.write(file.file.read())
-    # ⛔️ Do NOT index here. Keep upload fast to avoid 502s.
-    return {"ok": True, "stored_as": dest, "message": "Uploaded. Run POST /ingest to index all PDFs."}
+    # do NOT index here—keeps upload fast and avoids 502s on Render
+    return {"ok": True, "stored_as": dest, "message": "Uploaded. Now run POST /ingest-start."}
 
 # --------------------- Run with PyCharm -----------------
 # --- DEBUG: corpus stats and search preview ---
