@@ -454,6 +454,17 @@ def ask(req: AskRequest):
 
 @app.post("/ingest", response_model=IngestResponse)
 def ingest_all():
+    print("Ingest started…")
+    corpus = build_corpus(DATA_DIR)
+    INDEX.build(corpus, persist=True)
+    print("Ingest finished.")
+    return IngestResponse(
+        chunks_indexed=len(corpus),
+        files_seen=len({c["metadata"]["file"] for c in corpus})
+    )
+
+@app.post("/ingest", response_model=IngestResponse)
+def ingest_all():
     corpus = build_corpus(DATA_DIR)
     INDEX.build(corpus, persist=True)
     return IngestResponse(chunks_indexed=len(corpus), files_seen=len({c["metadata"]["file"] for c in corpus}))
@@ -462,12 +473,12 @@ def ingest_all():
 def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         return {"ok": False, "error": "Only PDF files are accepted."}
+    os.makedirs(DATA_DIR, exist_ok=True)
     dest = os.path.join(DATA_DIR, file.filename)
     with open(dest, "wb") as out:
         out.write(file.file.read())
-    corpus = build_corpus(DATA_DIR)
-    INDEX.build(corpus, persist=True)
-    return {"ok": True, "stored_as": dest}
+    # ⛔️ Do NOT index here. Keep upload fast to avoid 502s.
+    return {"ok": True, "stored_as": dest, "message": "Uploaded. Run POST /ingest to index all PDFs."}
 
 # --------------------- Run with PyCharm -----------------
 # --- DEBUG: corpus stats and search preview ---
