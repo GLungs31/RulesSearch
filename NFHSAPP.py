@@ -16,6 +16,8 @@ from typing import List, Dict, Optional, Any, Tuple
 import numpy as np
 import fitz  # PyMuPDF
 
+from threading import Thread, Lock
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
