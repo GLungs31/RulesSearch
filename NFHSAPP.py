@@ -151,13 +151,33 @@ class HybridIndex:
         self.bm25: Optional[BM25Okapi] = None
 
     def build(self, corpus: List[Dict[str, Any]], persist: bool = True) -> None:
+        self.corpus = corpus or []
+        self.texts = [c.get("text", "") for c in self.corpus if (c.get("text", "").strip())]
+        self.tokens = [self._tokenize_for_bm25(t) for t in self.texts]
+        self.bm25 = BM25Okapi(self.tokens) if self.texts else None
+
+        if not self.texts:
+            self.faiss_index = None
+            self.embeddings = None
+            self.model = None
+            if persist:
+                with open(META_PATH, "w", encoding="utf-8") as f:
+                    json.dump(self.corpus, f, ensure_ascii=False)
+            print("No text to index (0 chunks). Upload PDFs and call /ingest later.")
+            return
+
         self.corpus = corpus
         self.texts = [c["text"] for c in corpus]
 
         # Embeddings
         self.model = SentenceTransformer(self.embed_model_name)
         embs = self.model.encode(self.texts, normalize_embeddings=True, show_progress_bar=True).astype("float32")
-
+        if hasattr(embs, 'shape') and len(embs.shape) > 1:
+            dim = embs.shape[1]
+        else:
+            print("ERROR: Expected embeddings to be 2D, got shape", getattr(embs, 'shape', None))
+            # You might want to raise an exception or skip building the index
+            return
         if FAISS_OK:
             dim = embs.shape[1]
             index = faiss.IndexFlatIP(dim)  # cosine via normalized vectors (dot product)
@@ -387,6 +407,9 @@ class IngestResponse(BaseModel):
 
 # --------------------- FastAPI app ----------------------
 app = FastAPI(title="Athletics Handbooks Chatbot", version="1.0.0")
+@app.on_event("startup")
+def _startup():
+    ensure_index_loaded()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -396,12 +419,24 @@ app.add_middleware(
 INDEX = HybridIndex()
 
 def ensure_index_loaded() -> None:
+    # Try loading an existing index (OK if none yet)
     loaded = INDEX.load()
-    if not loaded:
-        corpus = build_corpus(DATA_DIR)
-        INDEX.build(corpus, persist=True)
+    if loaded:
+        print("Index loaded.")
+        return
 
-ensure_index_loaded()
+    # If there are no PDFs yet, skip building (keep API alive)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    pdfs = [f for f in os.listdir(DATA_DIR) if f.lower().endswith(".pdf")]
+    if not pdfs:
+        print(f"No PDFs found in {DATA_DIR}. Upload via /upload then run /ingest.")
+        return
+
+    # Build only if PDFs are present
+    corpus = build_corpus(DATA_DIR)
+    INDEX.build(corpus, persist=True)
+    print(f"Built index with {len(corpus)} chunks from {len({c['metadata']['file'] for c in corpus})} files.")
+
 
 @app.get("/health")
 def health():
