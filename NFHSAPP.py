@@ -4,6 +4,10 @@
 # - Run this file directly (green Run button) to start the API on http://127.0.0.1:8000
 # - Open http://127.0.0.1:8000/docs to try /ask and /upload
 
+from threading import Thread, Lock
+from fastapi import HTTPException
+import uuid, time
+
 import os
 import re
 import io
@@ -15,10 +19,6 @@ from typing import List, Dict, Optional, Any, Tuple
 
 import numpy as np
 import fitz  # PyMuPDF
-
-from threading import Thread, Lock
-from fastapi import HTTPException
-import uuid, time
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -116,6 +116,51 @@ def upload_pdf(file: UploadFile = File(...)):
     with open(dest, "wb") as out:
         out.write(file.file.read())
     return {"ok": True, "stored_as": dest, "message": "Uploaded. Now run POST /ingest-start."}
+# ---- background ingest support ----
+# tiny job store
+INGEST_JOBS = {}          # job_id -> {status, chunks, files, ...}
+INGEST_LOCK = Lock()
+
+# worker that does the heavy lifting
+def _ingest_worker(job_id: str):
+    try:
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id] = {"status": "running", "started_at": time.time()}
+        corpus = build_corpus(DATA_DIR)        # uses your existing function
+        INDEX.build(corpus, persist=True)      # uses your existing HybridIndex
+        files = len({c["metadata"]["file"] for c in corpus}) if corpus else 0
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id].update(
+                status="done",
+                chunks=len(corpus),
+                files=files,
+                finished_at=time.time(),
+                message="Index built."
+            )
+    except Exception as e:
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id] = {
+                "status": "error",
+                "error": str(e),
+                "finished_at": time.time()
+            }
+
+# start ingest (returns immediately with a job_id)
+@app.post("/ingest-start")
+def ingest_start():
+    job_id = str(uuid.uuid4())
+    with INGEST_LOCK:
+        INGEST_JOBS[job_id] = {"status": "queued", "started_at": time.time()}
+    Thread(target=_ingest_worker, args=(job_id,), daemon=True).start()
+    return {"job_id": job_id, "status": "queued", "tip": "Poll /ingest-status/{job_id} until status=done."}
+
+# check ingest status
+@app.get("/ingest-status/{job_id}")
+def ingest_status(job_id: str):
+    job = INGEST_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
 
 # Start ingest in background (returns job_id quickly)
 @app.post("/ingest-start")
