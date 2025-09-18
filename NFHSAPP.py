@@ -44,6 +44,8 @@ from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 
 # --------------------- Config ---------------------
+DATA_DIR = os.getenv("HB_DATA_DIR", "./handbooks")
+STORE_DIR = os.getenv("HB_STORE_DIR", "./store")
 DATA_DIR = "./handbooks"     # put PDFs here
 STORE_DIR = "./store"        # index/metadata here
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -54,6 +56,109 @@ os.makedirs(STORE_DIR, exist_ok=True)
 FAISS_PATH = os.path.join(STORE_DIR, "handbooks.faiss")
 EMB_PATH   = os.path.join(STORE_DIR, "embeddings.npy")
 META_PATH  = os.path.join(STORE_DIR, "metadata.json")
+
+app = FastAPI(title="HS Athletics Handbook Bot", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
+# Health check (quick “is it up?”)
+@app.get("/health")
+def health():
+    return {"ok": True, "docs": "/docs"}
+
+# Save-only upload (fast) — use this to upload PDFs
+@app.post("/upload")
+def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        return {"ok": False, "error": "Only PDF files are accepted."}
+    os.makedirs(DATA_DIR, exist_ok=True)
+    dest = os.path.join(DATA_DIR, file.filename)
+    with open(dest, "wb") as out:
+        out.write(file.file.read())
+    # IMPORTANT: do NOT index here. Keep upload fast to avoid 502s.
+    return {"ok": True, "stored_as": dest, "message": "Uploaded. Now run /ingest-start."}
+
+# Start ingest in background (returns a job_id immediately)
+@app.post("/ingest-start")
+def ingest_start():
+    job_id = str(uuid.uuid4())
+    with INGEST_LOCK:
+        INGEST_JOBS[job_id] = {"status": "queued", "started_at": time.time()}
+    t = Thread(target=_ingest_worker, args=(job_id,), daemon=True)
+    t.start()
+    return {"job_id": job_id, "status": "queued", "tip": "Poll /ingest-status/{job_id} until status=done."}
+
+# Poll ingest job status
+@app.get("/ingest-status/{job_id}")
+def ingest_status(job_id: str):
+    job = INGEST_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
+
+# Your existing /ask endpoint should already exist. If not, here’s a minimal one:
+class AskRequest(BaseModel):
+    question: str
+    state: Optional[str] = None
+    year: Optional[str] = None
+    doc_title: Optional[str] = None
+    top_k: int = 8
+
+class AskResponse(BaseModel):
+    answer: str
+    sources: List[Dict[str, Any]]
+
+@app.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest):
+    # build filters
+    filters = {}
+    if req.state: filters["state"] = req.state
+    if req.year: filters["year"] = req.year
+    if req.doc_title: filters["doc_title"] = req.doc_title
+
+    # run retrieval
+    hits = INDEX.hybrid_search(req.question, k=max(3, min(req.top_k, 15)), filters=filters)
+
+    # compose answer (use your existing compose_extractive_answer function)
+    answer, cites = compose_extractive_answer(req.question, hits)
+    return AskResponse(answer=answer, sources=cites)
+
+# serve your PDFs so citations can link to pages (optional but nice)
+app.mount("/handbooks", StaticFiles(directory=DATA_DIR), name="handbooks")
+
+INGEST_JOBS: Dict[str, Dict[str, Any]] = {}
+INGEST_LOCK = Lock()
+
+def _ingest_worker(job_id: str):
+    """Background job: read PDFs, build the index, and save it."""
+    from collections import defaultdict  # safe to import here if you want
+
+    try:
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id] = {**INGEST_JOBS.get(job_id, {}), "status": "running"}
+
+        # ---- build the corpus (you likely already have these functions) ----
+        corpus = build_corpus(DATA_DIR)  # <-- your existing function
+        INDEX.build(corpus, persist=True)  # <-- your existing HybridIndex.build
+
+        files = len({c["metadata"]["file"] for c in corpus}) if corpus else 0
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id].update(
+                status="done",
+                chunks=len(corpus),
+                files=files,
+                finished_at=time.time(),
+                message="Index built."
+            )
+    except Exception as e:
+        with INGEST_LOCK:
+            INGEST_JOBS[job_id].update(
+                status="error",
+                error=str(e),
+                finished_at=time.time()
+            )
 
 # --------------------- Helpers --------------------
 HEAD_RE = re.compile(r"^(Article|Rule|Section|Bylaw|Policy)\s+[\w\.\-]+.*", re.I | re.M)
@@ -409,7 +514,8 @@ class IngestResponse(BaseModel):
 app = FastAPI(title="Athletics Handbooks Chatbot", version="1.0.0")
 @app.on_event("startup")
 def _startup():
-    ensure_index_loaded()
+    ensure_index_loaded()  # safe: it should skip if no PDFs exist
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
